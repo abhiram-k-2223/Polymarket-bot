@@ -25,6 +25,7 @@ import {
 import { Wallet } from 'ethers';
 import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
+import type { PaperBroker } from './paper-broker.js';
 import { CACHE_TTL } from '../core/unified-cache.js';
 import { PolymarketError, ErrorCode } from '../core/errors.js';
 import type { Side, OrderType } from '../core/types.js';
@@ -74,6 +75,14 @@ export interface TradingServiceConfig {
   chainId?: number;
   /** Pre-generated API credentials (optional) */
   credentials?: ApiCredentials;
+  /** Paper mode: simulate fills, never touch CLOB. */
+  paperMode?: boolean;
+  paperBroker?: PaperBroker;
+}
+
+export interface PaperQuote {
+  bids: Array<{ price: number; size: number }>;
+  asks: Array<{ price: number; size: number }>;
 }
 
 // Order types
@@ -84,6 +93,7 @@ export interface LimitOrderParams {
   size: number;
   orderType?: 'GTC' | 'GTD';
   expiration?: number;
+  paperQuote?: PaperQuote;
 }
 
 export interface MarketOrderParams {
@@ -92,6 +102,7 @@ export interface MarketOrderParams {
   amount: number;
   price?: number;
   orderType?: 'FOK' | 'FAK';
+  paperQuote?: PaperQuote;
 }
 
 export interface Order {
@@ -113,6 +124,10 @@ export interface OrderResult {
   orderIds?: string[];
   errorMsg?: string;
   transactionHashes?: string[];
+  simulated?: boolean;
+  avgPrice?: number;
+  filledSize?: number;
+  feeUsd?: number;
 }
 
 export interface TradeInfo {
@@ -288,6 +303,14 @@ export class TradingService {
    * Orders below these limits will be rejected by the API.
    */
   async createLimitOrder(params: LimitOrderParams): Promise<OrderResult> {
+    if (this.config.paperMode && this.config.paperBroker) {
+      const q = params.paperQuote ?? { bids: [], asks: [] };
+      const fill = this.config.paperBroker.simulateLimitOrder({
+        side: params.side, price: params.price, size: params.size,
+        bids: q.bids, asks: q.asks,
+      });
+      return { success: fill.success, orderId: fill.orderId, errorMsg: fill.reason, simulated: true, avgPrice: fill.avgPrice, filledSize: fill.filledSize, feeUsd: fill.feeUsd };
+    }
     // Validate minimum order requirements before sending to API
     if (params.size < MIN_ORDER_SIZE_SHARES) {
       return {
@@ -357,6 +380,14 @@ export class TradingService {
    * Market orders below this limit will be rejected by the API.
    */
   async createMarketOrder(params: MarketOrderParams): Promise<OrderResult> {
+    if (this.config.paperMode && this.config.paperBroker) {
+      const q = params.paperQuote ?? { bids: [], asks: [] };
+      const fill = this.config.paperBroker.simulateMarketOrder({
+        side: params.side, amountUsd: params.amount,
+        bids: q.bids, asks: q.asks, referencePrice: params.price,
+      });
+      return { success: fill.success, orderId: fill.orderId, errorMsg: fill.reason, simulated: true, avgPrice: fill.avgPrice, filledSize: fill.filledSize, feeUsd: fill.feeUsd };
+    }
     // Validate minimum order value before sending to API
     if (params.amount < MIN_ORDER_VALUE_USDC) {
       return {
