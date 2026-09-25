@@ -1188,12 +1188,13 @@ export class SmartMoneyService {
           // Reference price for premium guard + protection cap.
           let referencePrice = trade.price;
           let quoteGuardFailed = false;
+          let latestBook: Awaited<ReturnType<MarketService['getTokenOrderbook']>> | null = null;
           if (this.marketService) {
             try {
-              const book = await this.marketService.getTokenOrderbook(tokenId);
-              const bestAsk = book.asks[0]?.price;
-              const bestBid = book.bids[0]?.price;
-              const bestAskSize = book.asks[0]?.size ?? 0;
+              latestBook = await this.marketService.getTokenOrderbook(tokenId);
+              const bestAsk = latestBook.asks[0]?.price;
+              const bestBid = latestBook.bids[0]?.price;
+              const bestAskSize = latestBook.asks[0]?.size ?? 0;
               if (
                 bestAsk !== undefined && bestBid !== undefined &&
                 bestAsk > 0 && bestBid > 0
@@ -1233,6 +1234,7 @@ export class SmartMoneyService {
 
           const usdcAmount = copyValue; // Already calculated above
           const feeEstimate = estimateTakerFee(usdcAmount, feeRateBps);
+          const paperQuote = latestBook ? { bids: latestBook.bids.map(l => ({ price: l.price, size: l.size })), asks: latestBook.asks.map(l => ({ price: l.price, size: l.size })) } : undefined;
 
           // Audit #4: risk gate on exposure-opening (BUY) copies only.
           if (trade.side === 'BUY') {
@@ -1252,7 +1254,10 @@ export class SmartMoneyService {
           // Execute
           let result: OrderResult;
 
-          if (dryRun) {
+          if (this.tradingService && (this.tradingService as unknown as { config?: { paperMode?: boolean } }).config?.paperMode) {
+            result = await this.tradingService.createMarketOrder({ tokenId, side: trade.side, amount: usdcAmount, price: slippagePrice, orderType, paperQuote } as never);
+            (result as unknown as { simulated?: boolean }).simulated = true;
+          } else if (dryRun) {
             result = { success: true, orderId: `dry_run_${Date.now()}` };
             console.log('[DRY RUN]', {
               trader: trade.traderAddress.slice(0, 10),
