@@ -25,7 +25,8 @@ import {
   type MarketSubscription,
   type OrderbookSnapshot,
 } from './realtime-service-v2.js';
-import { TradingService } from './trading-service.js';
+import { TradingService, type PaperQuote } from './trading-service.js';
+import type { PaperBroker } from './paper-broker.js';
 import { MarketService } from './market-service.js';
 import { CTFClient, type TokenIds } from '../clients/ctf-client.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
@@ -113,6 +114,12 @@ export interface ArbitrageServiceConfig {
    * are gated — closes/exits bypass it inside the callees.
    */
   preExecutionGuard?: PreExecutionGuard;
+  /**
+   * Paper mode: build a broker-backed TradingService even without a private
+   * key. All fills simulate via PaperBroker; no live calls are made.
+   */
+  paperMode?: boolean;
+  paperBroker?: PaperBroker;
 }
 
 export interface RebalanceAction {
@@ -263,6 +270,10 @@ export interface ArbitrageExecutionResult {
   txHashes: string[];
   error?: string;
   executionTimeMs: number;
+  /** First simulated order id (paper mode only, `paper_...`). */
+  orderId?: string;
+  /** True when the fills were simulated via PaperBroker (paper mode). */
+  simulated?: boolean;
 }
 
 export interface ArbitrageServiceEvents {
@@ -287,9 +298,11 @@ export class ArbitrageService extends EventEmitter {
   private rateLimiter: RateLimiter;
 
   private market: ArbitrageMarketConfig | null = null;
-  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval' | 'preExecutionGuard'> & {
+  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval' | 'preExecutionGuard' | 'paperMode' | 'paperBroker'> & {
     privateKey?: string;
     rpcUrl?: string;
+    paperMode?: boolean;
+    paperBroker?: PaperBroker;
     rebalanceIntervalMs: number;
     preExecutionGuard?: PreExecutionGuard;
   };
@@ -359,22 +372,35 @@ export class ArbitrageService extends EventEmitter {
       sequentialExecution: config.sequentialExecution ?? true,
       // Audit #4: risk gate passes straight through (no default — unset = unguarded, caller's choice)
       preExecutionGuard: config.preExecutionGuard,
+      // Paper mode passthrough (paper-trading Task 5): broker-backed simulation.
+      paperMode: config.paperMode,
+      paperBroker: config.paperBroker,
     };
 
     this.rateLimiter = new RateLimiter();
     this.realtimeService = new RealtimeServiceV2({ debug: false });
 
-    // Initialize trading clients if private key provided
-    if (this.config.privateKey) {
-      this.ctf = new CTFClient({
-        privateKey: this.config.privateKey,
-        rpcUrl: this.config.rpcUrl,
-      });
+    // Initialize trading clients if private key provided, or a paper broker
+    // for simulation without a key. The paper TradingService never signs or
+    // touches the network: TradingService routes every order through the
+    // broker before any live init, and start() skips live init in paper mode.
+    if (this.config.privateKey || (this.config.paperMode && this.config.paperBroker)) {
+      if (this.config.privateKey) {
+        this.ctf = new CTFClient({
+          privateKey: this.config.privateKey,
+          rpcUrl: this.config.rpcUrl,
+        });
+      }
 
       const cache = createUnifiedCache();
       this.tradingService = new TradingService(this.rateLimiter, cache, {
-        privateKey: this.config.privateKey,
+        // Paper-only placeholder: never used for signing — the paper branch
+        // in TradingService returns simulated fills before touching the wallet.
+        privateKey: this.config.privateKey ?? `0x${'1'.repeat(64)}`,
         chainId: 137,
+        ...(this.config.paperMode && this.config.paperBroker
+          ? { paperMode: true, paperBroker: this.config.paperBroker }
+          : {}),
       });
     }
 
@@ -410,8 +436,9 @@ export class ArbitrageService extends EventEmitter {
     this.log(`Profit Threshold: ${(this.config.profitThreshold * 100).toFixed(2)}%`);
     this.log(`Auto Execute: ${this.config.autoExecute ? 'YES' : 'NO'}`);
 
-    // Initialize trading service
-    if (this.tradingService) {
+    // Initialize trading service (skipped in paper mode: no live init —
+    // the broker-backed TradingService simulates without CLOB/on-chain).
+    if (this.tradingService && !this.isPaperTrading()) {
       await this.tradingService.initialize();
       this.log(`Wallet: ${this.ctf?.getAddress()}`);
       await this.updateBalance();
@@ -435,6 +462,8 @@ export class ArbitrageService extends EventEmitter {
           this.config.rebalanceIntervalMs
         );
       }
+    } else if (this.isPaperTrading()) {
+      this.log('Paper trading mode - simulated execution, no live init');
     } else {
       this.log('No wallet configured - monitoring only');
     }
@@ -637,6 +666,32 @@ export class ArbitrageService extends EventEmitter {
   }
 
   /**
+   * Paper mode when the active TradingService is broker-backed. Detected from
+   * the service itself (not our own config) so an injected paper
+   * TradingService is honored too.
+   */
+  private isPaperTrading(): boolean {
+    const cfg = (this.tradingService as unknown as {
+      config?: { paperMode?: boolean; paperBroker?: unknown };
+    } | null)?.config;
+    return !!this.tradingService && !!cfg?.paperMode && !!cfg?.paperBroker;
+  }
+
+  /**
+   * Snapshot current orderbook state as a Task 3 PaperQuote. Every
+   * createMarketOrder call site carries this so paper fills simulate
+   * against live depth; live TradingService ignores the extra param.
+   */
+  private buildPaperQuote(): PaperQuote {
+    const map = (levels: Array<{ price: number; size: number }>) =>
+      levels.map((l) => ({ price: l.price, size: l.size }));
+    return {
+      bids: [...map(this.orderbook.yesBids), ...map(this.orderbook.noBids)],
+      asks: [...map(this.orderbook.yesAsks), ...map(this.orderbook.noAsks)],
+    };
+  }
+
+  /**
    * Manually execute an arbitrage opportunity
    */
   async execute(opportunity: ArbitrageOpportunity): Promise<ArbitrageExecutionResult> {
@@ -659,7 +714,9 @@ export class ArbitrageService extends EventEmitter {
       };
     }
 
-    if (!this.ctf || !this.tradingService || !this.market) {
+    // Paper mode needs only the broker-backed tradingService: no private
+    // key, CTF client, or started market is required for simulation.
+    if (!this.tradingService || ((!this.ctf || !this.market) && !this.isPaperTrading())) {
       return {
         success: false,
         type: opportunity.type,
@@ -826,11 +883,13 @@ export class ArbitrageService extends EventEmitter {
           break;
         }
         case 'sell_yes': {
+          const paperQuote = this.buildPaperQuote();
           const result = await this.tradingService.createMarketOrder({
             tokenId: this.market.yesTokenId,
             side: 'SELL',
             amount: rebalanceAction.amount,
             orderType: 'FOK',
+            paperQuote,
           });
           if (!result.success) {
             throw new Error(result.errorMsg || 'Sell YES failed');
@@ -839,11 +898,13 @@ export class ArbitrageService extends EventEmitter {
           break;
         }
         case 'sell_no': {
+          const paperQuote = this.buildPaperQuote();
           const result = await this.tradingService.createMarketOrder({
             tokenId: this.market.noTokenId,
             side: 'SELL',
             amount: rebalanceAction.amount,
             orderType: 'FOK',
+            paperQuote,
           });
           if (!result.success) {
             throw new Error(result.errorMsg || 'Sell NO failed');
@@ -1227,11 +1288,13 @@ export class ArbitrageService extends EventEmitter {
       if (this.tradingService && unpairedYes >= this.config.minTradeSize) {
         try {
           const sellAmount = Math.floor(unpairedYes * 1e6) / 1e6;
+          const paperQuote = this.buildPaperQuote();
           const result = await this.tradingService.createMarketOrder({
             tokenId: market.yesTokenId,
             side: 'SELL',
             amount: sellAmount,
             orderType: 'FOK',
+            paperQuote,
           });
           if (result.success) {
             // Estimate USDC received (conservative estimate since we don't have exact trade info)
@@ -1262,11 +1325,13 @@ export class ArbitrageService extends EventEmitter {
       if (this.tradingService && unpairedNo >= this.config.minTradeSize) {
         try {
           const sellAmount = Math.floor(unpairedNo * 1e6) / 1e6;
+          const paperQuote = this.buildPaperQuote();
           const result = await this.tradingService.createMarketOrder({
             tokenId: market.noTokenId,
             side: 'SELL',
             amount: sellAmount,
             orderType: 'FOK',
+            paperQuote,
           });
           if (result.success) {
             // Estimate USDC received (conservative estimate since we don't have exact trade info)
@@ -1429,12 +1494,14 @@ export class ArbitrageService extends EventEmitter {
           ? bestYesBid * (1 - this.config.maxSlippagePct)
           : undefined;
         // Sell excess YES
+        const paperQuote = this.buildPaperQuote();
         const result = await this.tradingService.createMarketOrder({
           tokenId: this.market.yesTokenId,
           side: 'SELL',
           amount: sellAmount,
           ...(yesFloor !== undefined ? { price: yesFloor } : {}),
           orderType: 'FOK',
+          paperQuote,
         });
         if (result.success) {
           this.log(`   ✅ Sold ${sellAmount.toFixed(2)} excess YES to restore balance`);
@@ -1445,12 +1512,14 @@ export class ArbitrageService extends EventEmitter {
           ? bestNoBid * (1 - this.config.maxSlippagePct)
           : undefined;
         // Sell excess NO
+        const paperQuote = this.buildPaperQuote();
         const result = await this.tradingService.createMarketOrder({
           tokenId: this.market.noTokenId,
           side: 'SELL',
           amount: sellAmount,
           ...(noFloor !== undefined ? { price: noFloor } : {}),
           orderType: 'FOK',
+          paperQuote,
         });
         if (result.success) {
           this.log(`   ✅ Sold ${sellAmount.toFixed(2)} excess NO to restore balance`);
@@ -1496,6 +1565,12 @@ export class ArbitrageService extends EventEmitter {
     this.log(`\nExecuting Long Arb (Buy → Merge)...`);
 
     try {
+      // Paper fast-path: simulate both legs against current depth with no
+      // balance, market, or on-chain merge requirements.
+      if (this.isPaperTrading()) {
+        return this.executeLongArbPaper(opportunity, startTime);
+      }
+
       const { buyYes, buyNo } = opportunity.effectivePrices;
       const requiredUsdc = (buyYes + buyNo) * size;
 
@@ -1519,12 +1594,14 @@ export class ArbitrageService extends EventEmitter {
       const buyYesCap = opportunity.priceCaps?.buyYes ?? buyYes * (1 + this.config.maxSlippagePct);
       const buyNoCap = opportunity.priceCaps?.buyNo ?? buyNo * (1 + this.config.maxSlippagePct);
       this.log(`  1. Buying legs sequentially (caps YES=${buyYesCap.toFixed(4)}, NO=${buyNoCap.toFixed(4)})...`);
+      const paperQuote = this.buildPaperQuote();
       const buyYesResult = await this.tradingService!.createMarketOrder({
         tokenId: this.market!.yesTokenId,
         side: 'BUY',
         amount: size * buyYes,
         price: buyYesCap,
         orderType: 'FOK',
+        paperQuote,
       });
       if (!buyYesResult.success) {
         return {
@@ -1543,6 +1620,7 @@ export class ArbitrageService extends EventEmitter {
         amount: size * buyNo,
         price: buyNoCap,
         orderType: 'FOK',
+        paperQuote,
       });
 
       const outcomes = this.market!.outcomes || ['YES', 'NO'];
@@ -1651,6 +1729,12 @@ export class ArbitrageService extends EventEmitter {
     this.log(`\nExecuting Short Arb (Sell Pre-held Tokens)...`);
 
     try {
+      // Paper fast-path: simulate both legs against current depth with no
+      // held-token, market, or reconciliation requirements.
+      if (this.isPaperTrading()) {
+        return this.executeShortArbPaper(opportunity, startTime);
+      }
+
       const heldPairs = Math.min(this.balance.yesTokens, this.balance.noTokens);
 
       if (heldPairs < size) {
@@ -1671,12 +1755,14 @@ export class ArbitrageService extends EventEmitter {
       const sellNoFloor = opportunity.priceCaps?.sellNo
         ?? opportunity.effectivePrices.sellNo * (1 - this.config.maxSlippagePct);
       this.log(`  1. Selling pre-held legs sequentially (floors YES=${sellYesFloor.toFixed(4)}, NO=${sellNoFloor.toFixed(4)})...`);
+      const paperQuote = this.buildPaperQuote();
       const sellYesResult = await this.tradingService!.createMarketOrder({
         tokenId: this.market!.yesTokenId,
         side: 'SELL',
         amount: size,
         price: sellYesFloor,
         orderType: 'FOK',
+        paperQuote,
       });
       if (!sellYesResult.success) {
         return {
@@ -1695,6 +1781,7 @@ export class ArbitrageService extends EventEmitter {
         amount: size,
         price: sellNoFloor,
         orderType: 'FOK',
+        paperQuote,
       });
 
       const outcomes = this.market!.outcomes || ['YES', 'NO'];
@@ -1746,6 +1833,152 @@ export class ArbitrageService extends EventEmitter {
         executionTimeMs: Date.now() - startTime,
       };
     }
+  }
+
+  /**
+   * Paper long arb: simulate both BUY legs against current depth. No balance
+   * check, no started market, and no on-chain merge — a filled long pair is
+   * worth $1 by construction, so profit follows the quoted edge. Every order
+   * carries the Task 3 paperQuote choke point; the broker never touches live.
+   */
+  private async executeLongArbPaper(
+    opportunity: ArbitrageOpportunity,
+    startTime: number
+  ): Promise<ArbitrageExecutionResult> {
+    const size = opportunity.recommendedSize;
+    const { buyYes, buyNo } = opportunity.effectivePrices;
+    const buyYesCap = opportunity.priceCaps?.buyYes ?? buyYes * (1 + this.config.maxSlippagePct);
+    const buyNoCap = opportunity.priceCaps?.buyNo ?? buyNo * (1 + this.config.maxSlippagePct);
+    const paperQuote = this.buildPaperQuote();
+    const yesTokenId = this.market?.yesTokenId ?? 'paper-yes';
+    const noTokenId = this.market?.noTokenId ?? 'paper-no';
+    this.log(`  [paper] Simulating long arb (caps YES=${buyYesCap.toFixed(4)}, NO=${buyNoCap.toFixed(4)})...`);
+    const buyYesResult = await this.tradingService!.createMarketOrder({
+      tokenId: yesTokenId,
+      side: 'BUY',
+      amount: size * buyYes,
+      price: buyYesCap,
+      orderType: 'FOK',
+      paperQuote,
+    });
+    if (!buyYesResult.success) {
+      return {
+        success: false,
+        type: 'long',
+        size,
+        profit: 0,
+        txHashes: [],
+        error: `Leg 1 (YES) failed: ${buyYesResult.errorMsg}`,
+        executionTimeMs: Date.now() - startTime,
+        simulated: true,
+      };
+    }
+    const buyNoResult = await this.tradingService!.createMarketOrder({
+      tokenId: noTokenId,
+      side: 'BUY',
+      amount: size * buyNo,
+      price: buyNoCap,
+      orderType: 'FOK',
+      paperQuote,
+    });
+    if (!buyNoResult.success) {
+      return {
+        success: false,
+        type: 'long',
+        size,
+        profit: 0,
+        txHashes: buyYesResult.orderId ? [buyYesResult.orderId] : [],
+        error: `Leg 2 (NO) failed: ${buyNoResult.errorMsg}`,
+        executionTimeMs: Date.now() - startTime,
+        simulated: true,
+      };
+    }
+    const profit = opportunity.profitRate * size;
+    const txHashes = [buyYesResult.orderId, buyNoResult.orderId].filter((h): h is string => !!h);
+    this.log(`  [paper] Long arb simulated! Profit: ~$${profit.toFixed(2)}`);
+    return {
+      success: true,
+      type: 'long',
+      size,
+      profit,
+      txHashes,
+      orderId: buyYesResult.orderId,
+      simulated: true,
+      executionTimeMs: Date.now() - startTime,
+    };
+  }
+
+  /**
+   * Paper short arb: simulate both SELL legs against current depth. No
+   * held-token requirement and no post-fill reconciliation — balances are
+   * simulated, so there is nothing on-chain to unwind.
+   */
+  private async executeShortArbPaper(
+    opportunity: ArbitrageOpportunity,
+    startTime: number
+  ): Promise<ArbitrageExecutionResult> {
+    const size = opportunity.recommendedSize;
+    const sellYesFloor = opportunity.priceCaps?.sellYes
+      ?? opportunity.effectivePrices.sellYes * (1 - this.config.maxSlippagePct);
+    const sellNoFloor = opportunity.priceCaps?.sellNo
+      ?? opportunity.effectivePrices.sellNo * (1 - this.config.maxSlippagePct);
+    const paperQuote = this.buildPaperQuote();
+    const yesTokenId = this.market?.yesTokenId ?? 'paper-yes';
+    const noTokenId = this.market?.noTokenId ?? 'paper-no';
+    this.log(`  [paper] Simulating short arb (floors YES=${sellYesFloor.toFixed(4)}, NO=${sellNoFloor.toFixed(4)})...`);
+    const sellYesResult = await this.tradingService!.createMarketOrder({
+      tokenId: yesTokenId,
+      side: 'SELL',
+      amount: size,
+      price: sellYesFloor,
+      orderType: 'FOK',
+      paperQuote,
+    });
+    if (!sellYesResult.success) {
+      return {
+        success: false,
+        type: 'short',
+        size,
+        profit: 0,
+        txHashes: [],
+        error: `Leg 1 (YES) failed: ${sellYesResult.errorMsg}`,
+        executionTimeMs: Date.now() - startTime,
+        simulated: true,
+      };
+    }
+    const sellNoResult = await this.tradingService!.createMarketOrder({
+      tokenId: noTokenId,
+      side: 'SELL',
+      amount: size,
+      price: sellNoFloor,
+      orderType: 'FOK',
+      paperQuote,
+    });
+    if (!sellNoResult.success) {
+      return {
+        success: false,
+        type: 'short',
+        size,
+        profit: 0,
+        txHashes: sellYesResult.orderId ? [sellYesResult.orderId] : [],
+        error: `Leg 2 (NO) failed: ${sellNoResult.errorMsg}`,
+        executionTimeMs: Date.now() - startTime,
+        simulated: true,
+      };
+    }
+    const profit = opportunity.profitRate * size;
+    const txHashes = [sellYesResult.orderId, sellNoResult.orderId].filter((h): h is string => !!h);
+    this.log(`  [paper] Short arb simulated! Profit: ~$${profit.toFixed(2)}`);
+    return {
+      success: true,
+      type: 'short',
+      size,
+      profit,
+      txHashes,
+      orderId: sellYesResult.orderId,
+      simulated: true,
+      executionTimeMs: Date.now() - startTime,
+    };
   }
 
   private log(message: string): void {

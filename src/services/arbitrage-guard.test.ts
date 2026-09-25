@@ -46,3 +46,24 @@ describe('ArbitrageService preExecutionGuard (audit #4)', () => {
     ]);
   });
 });
+
+describe('ArbitrageService paper mode', () => {
+  it('paper execution simulates without a private key', async () => {
+    const { PaperBroker } = await import('./paper-broker.js');
+    const { RateLimiter } = await import('../core/rate-limiter.js');
+    const { createUnifiedCache } = await import('../core/unified-cache.js');
+    const { TradingService } = await import('./trading-service.js');
+    const broker = new PaperBroker();
+    const trading = new TradingService(new RateLimiter(), createUnifiedCache(), {
+      privateKey: '0x' + '1'.repeat(64), paperMode: true, paperBroker: broker,
+    } as never);
+    (trading as unknown as { ensureInitialized: () => Promise<never> }).ensureInitialized = async () => {
+      throw new Error('LIVE_CALL_ATTEMPTED');
+    };
+    const svc = new ArbitrageService({ autoExecute: true, preExecutionGuard: () => null });
+    (svc as unknown as { tradingService: typeof trading }).tradingService = trading;
+    const result = await svc.execute(opp);
+    expect(result.success).toBe(true);
+    expect(String((result as unknown as { orderId?: string }).orderId ?? '')).toMatch(/paper_/);
+  });
+});
