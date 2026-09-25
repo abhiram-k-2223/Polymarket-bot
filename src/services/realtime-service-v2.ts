@@ -213,6 +213,22 @@ export interface Subscription {
   unsubscribe: () => void;
 }
 
+export interface SubHealth {
+  subId: string;
+  topic: string;
+  messageCount: number;
+  lastMessageAt: number;
+  silentMs: number;
+  degraded: boolean;
+}
+
+export interface RealtimeHealth {
+  connected: boolean;
+  subscriptions: SubHealth[];
+  disconnectCounts: Record<string, number>;
+  resubscribeCount: number;
+}
+
 export interface MarketSubscription extends Subscription {
   tokenIds: string[];
 }
@@ -261,6 +277,11 @@ export class RealtimeServiceV2 extends EventEmitter {
 
   // Store subscription messages for reconnection
   private subscriptionMessages: Map<string, { subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }> = new Map();
+
+  private subHealth: Map<string, { topic: string; messageCount: number; lastMessageAt: number }> = new Map();
+  private disconnectCounts: Record<string, number> = {};
+  private resubscribeCount = 0;
+  private lastStatusChangeAt = 0;
 
   // Caches
   private priceCache: Map<string, PriceUpdate> = new Map();
@@ -388,11 +409,13 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('tickSizeChange', tickSizeHandler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subHealth.delete(subId);
         this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
     this.subscriptions.set(subId, subscription);
+    this.subHealth.set(subId, { topic: 'clob_market', messageCount: 0, lastMessageAt: 0 });
     return subscription;
   }
 
@@ -506,10 +529,12 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('marketEvent', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subHealth.delete(subId);
       },
     };
 
     this.subscriptions.set(subId, subscription);
+    this.subHealth.set(subId, { topic: 'clob_market', messageCount: 0, lastMessageAt: 0 });
     return subscription;
   }
 
@@ -546,10 +571,12 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('userTrade', tradeHandler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subHealth.delete(subId);
       },
     };
 
     this.subscriptions.set(subId, subscription);
+    this.subHealth.set(subId, { topic: 'clob_user', messageCount: 0, lastMessageAt: 0 });
     return subscription;
   }
 
@@ -599,10 +626,12 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('activityTrade', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subHealth.delete(subId);
       },
     };
 
     this.subscriptions.set(subId, subscription);
+    this.subHealth.set(subId, { topic: 'activity', messageCount: 0, lastMessageAt: 0 });
     return subscription;
   }
 
@@ -651,10 +680,12 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('cryptoPrice', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subHealth.delete(subId);
       },
     };
 
     this.subscriptions.set(subId, subscription);
+    this.subHealth.set(subId, { topic: 'crypto_prices', messageCount: 0, lastMessageAt: 0 });
     return subscription;
   }
 
@@ -690,11 +721,13 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('cryptoChainlinkPrice', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subHealth.delete(subId);
         this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
     this.subscriptions.set(subId, subscription);
+    this.subHealth.set(subId, { topic: 'crypto_prices_chainlink', messageCount: 0, lastMessageAt: 0 });
     return subscription;
   }
 
@@ -733,10 +766,12 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('equityPrice', handler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subHealth.delete(subId);
       },
     };
 
     this.subscriptions.set(subId, subscription);
+    this.subHealth.set(subId, { topic: 'equity_prices', messageCount: 0, lastMessageAt: 0 });
     return subscription;
   }
 
@@ -784,10 +819,12 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('reaction', reactionHandler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subHealth.delete(subId);
       },
     };
 
     this.subscriptions.set(subId, subscription);
+    this.subHealth.set(subId, { topic: 'comments', messageCount: 0, lastMessageAt: 0 });
     return subscription;
   }
 
@@ -832,10 +869,12 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('rfqQuote', quoteHandler);
         this.sendUnsubscription({ subscriptions });
         this.subscriptions.delete(subId);
+        this.subHealth.delete(subId);
       },
     };
 
     this.subscriptions.set(subId, subscription);
+    this.subHealth.set(subId, { topic: 'rfq', messageCount: 0, lastMessageAt: 0 });
     return subscription;
   }
 
@@ -882,6 +921,21 @@ export class RealtimeServiceV2 extends EventEmitter {
     return Array.from(this.subscriptions.values());
   }
 
+  recordDisconnect(code: number | string): void {
+    const k = String(code);
+    this.disconnectCounts[k] = (this.disconnectCounts[k] ?? 0) + 1;
+    this.lastStatusChangeAt = Date.now();
+  }
+
+  getHealth(silenceThresholdMs = 90_000): RealtimeHealth {
+    const now = Date.now();
+    const subscriptions: SubHealth[] = [...this.subHealth.entries()].map(([subId, s]) => {
+      const silentMs = s.lastMessageAt > 0 ? now - s.lastMessageAt : Number.MAX_SAFE_INTEGER;
+      return { subId, topic: s.topic, messageCount: s.messageCount, lastMessageAt: s.lastMessageAt, silentMs, degraded: silentMs > silenceThresholdMs };
+    });
+    return { connected: this.connected, subscriptions, disconnectCounts: { ...this.disconnectCounts }, resubscribeCount: this.resubscribeCount };
+  }
+
   /**
    * Unsubscribe from all
    */
@@ -903,6 +957,7 @@ export class RealtimeServiceV2 extends EventEmitter {
 
     // Re-subscribe to all active subscriptions on reconnect
     if (this.subscriptionMessages.size > 0) {
+      this.resubscribeCount += 1;
       this.log(`Re-subscribing to ${this.subscriptionMessages.size} subscriptions...`);
       for (const [subId, msg] of this.subscriptionMessages) {
         this.log(`Re-subscribing: ${subId}`);
@@ -913,11 +968,14 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.emit('connected');
   }
 
-  private handleStatusChange(status: ConnectionStatus): void {
+  private handleStatusChange(status: ConnectionStatus, code?: number | string): void {
     this.log(`Connection status: ${status}`);
+    this.lastStatusChangeAt = Date.now();
 
     if (status === ConnectionStatus.DISCONNECTED) {
       this.connected = false;
+      const extracted = code ?? (status as unknown as { code?: number | string })?.code ?? 'unknown';
+      this.disconnectCounts[String(extracted)] = (this.disconnectCounts[String(extracted)] ?? 0) + 1;
       this.emit('disconnected');
     } else if (status === ConnectionStatus.CONNECTED) {
       this.connected = true;
@@ -928,6 +986,7 @@ export class RealtimeServiceV2 extends EventEmitter {
 
   private handleMessage(client: RealTimeDataClient, message: Message): void {
     this.log(`Received: ${message.topic}:${message.type}`);
+    this.bumpSubHealth(message.topic);
 
     const payload = message.payload as Record<string, unknown>;
 
@@ -1222,6 +1281,21 @@ export class RealtimeServiceV2 extends EventEmitter {
       spread,
       timestamp: book.timestamp,
     };
+  }
+
+  private bumpSubHealth(topic: string): void {
+    const now = Date.now();
+    let matched = false;
+    for (const entry of this.subHealth.values()) {
+      if (entry.topic === topic) {
+        entry.messageCount += 1;
+        entry.lastMessageAt = now;
+        matched = true;
+      }
+    }
+    if (!matched) {
+      this.subHealth.set(topic, { topic, messageCount: 1, lastMessageAt: now });
+    }
   }
 
   private sendSubscription(msg: { subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }): void {
