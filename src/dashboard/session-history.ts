@@ -59,6 +59,10 @@ export interface SessionSummary {
   };
   trades: TradeRecord[];
   dryRun: boolean;
+  /** True when the session ran with PAPER_TRADING (broker-simulated fills). */
+  paperTrading: boolean;
+  /** Paper sessions are always simulated; live sessions never are. */
+  simulated: boolean;
   strategies: {
     smartMoney: boolean;
     arbitrage: boolean;
@@ -181,6 +185,7 @@ export function createSessionFromState(
   },
   config: {
     dryRun: boolean;
+    paperTrading?: boolean;
     smartMoney: { enabled: boolean };
     arbitrage: { enabled: boolean };
     dipArb: { enabled: boolean };
@@ -263,6 +268,8 @@ export function createSessionFromState(
     },
     trades,
     dryRun: config.dryRun,
+    paperTrading: config.paperTrading === true,
+    simulated: config.paperTrading === true,
     strategies: {
       smartMoney: config.smartMoney.enabled,
       arbitrage: config.arbitrage.enabled,

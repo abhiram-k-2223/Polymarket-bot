@@ -156,6 +156,8 @@ export interface BotConfig {
     enabled: boolean;
   };
   dryRun: boolean;
+  /** True when fills are broker-simulated (paper mode); history marks these sessions simulated. */
+  paperTrading: boolean;
 }
 
 export type LogLevel =

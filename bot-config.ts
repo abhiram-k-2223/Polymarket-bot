@@ -45,6 +45,8 @@ import {
   type RiskIntent,
 } from './src/utils/risk.js';
 import { fetchClosedPnls } from './src/utils/closed-positions.js';
+import { PaperBroker } from './src/services/paper-broker.js';
+import { PaperAccount } from './src/services/paper-account.js';
 
 // ============================================================================
 // CONFIGURATION
@@ -168,6 +170,38 @@ const CONFIG = {
   dryRun: process.env.DRY_RUN !== 'false',
   paperTrading: process.env.PAPER_TRADING === 'true',
 };
+
+// ============================================================================
+// PAPER-TRADING BRIDGE (Task 9)
+// ============================================================================
+
+// One shared broker + ledger for the whole process. Null unless paper mode,
+// so live wiring is untouched. paperMode/paperBroker are always set PAIRED
+// (the Task 3 choke point routes only when BOTH are present).
+const paperBroker = CONFIG.paperTrading
+  ? new PaperBroker({ estimatedGasCostUsd: CONFIG.arbitrage.estimatedGasCostUSD })
+  : null;
+const paperAccount = CONFIG.paperTrading ? new PaperAccount(CONFIG.capital.totalUsd) : null;
+// Open simulated notional per market key. The fill layer has no close
+// linkage, so closes release against this map (clamped, never negative).
+const paperOpenUsd = new Map<string, number>();
+// Latest polled feed/WS health, surfaced in displayStatus (60s poll in main).
+const paperHealth = { degraded: 0, priceSource: 'none' };
+
+function paperMarketOpen(key: string, valueUsd: number): void {
+  if (!paperAccount || !(valueUsd > 0)) return;
+  paperOpenUsd.set(key, (paperOpenUsd.get(key) ?? 0) + valueUsd);
+}
+
+function paperMarketClose(key: string, pnlUsd: number, releaseUsd?: number): void {
+  if (!paperAccount) return;
+  const open = paperOpenUsd.get(key) ?? 0;
+  const release = Math.min(releaseUsd ?? open, open);
+  // recordClose takes GROSS PnL; the snapshot nets accumulated fill fees.
+  paperAccount.recordClose(pnlUsd, key, release);
+  if (release >= open) paperOpenUsd.delete(key);
+  else paperOpenUsd.set(key, open - release);
+}
 
 // ============================================================================
 // STATE
@@ -606,6 +640,24 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
       onTrade: (trade, result) => {
         if (result.success) {
           log('TRADE', `Copied ${trade.side} from ${trade.traderAddress.slice(0, 8)}...`);
+          // Paper bridge: broker fill detail rides on the paper OrderResult.
+          if (paperAccount && (result as unknown as { simulated?: boolean }).simulated === true) {
+            const fill = result as unknown as { avgPrice?: number; filledSize?: number; feeUsd?: number };
+            const value = (fill.avgPrice ?? 0) * (fill.filledSize ?? 0);
+            const key = trade.tokenId ?? trade.conditionId ?? trade.marketSlug ?? 'smartMoney';
+            if (value > 0) {
+              paperAccount.recordFill({
+                marketKey: key,
+                avgPrice: fill.avgPrice ?? 0,
+                filledSize: fill.filledSize ?? 0,
+                filledValueUsd: value,
+                feeUsd: fill.feeUsd ?? 0,
+                slippageBps: 0,
+              });
+              trackExposure(key, value);
+              paperMarketOpen(key, value);
+            }
+          }
         }
       },
       // Audit #2: record realized PnL when copies close, not $0 per copy.
@@ -613,6 +665,12 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
       onCopyPnl: (info) => {
         log('TRADE', `Copy closed ${info.closedSize.toFixed(2)} @ PnL $${info.realizedUsd.toFixed(2)}`);
         recordTrade(info.realizedUsd, 'smartMoney');
+        // Paper bridge: FIFO-realized close against tracked open notional.
+        if (paperAccount) {
+          const open = paperOpenUsd.get(info.tokenId) ?? 0;
+          paperMarketClose(info.tokenId, info.realizedUsd, open);
+          releaseExposure(info.tokenId, open);
+        }
       },
       onError: (err) => log('ERROR', `Copy error: ${err.message}`),
     });
@@ -639,6 +697,10 @@ async function setupArbitrage(sdk: PolymarketSDK) {
     enableRebalancer: (!CONFIG.dryRun || CONFIG.paperTrading) && CONFIG.arbitrage.enableRebalancer,
     enableLogging: true,
     preExecutionGuard: riskGuard, // Audit #4: risk limits gate arb too
+    // Paper: paired mode+broker so the choke point simulates (Task 3
+    // fall-through needs BOTH; never set one without the other).
+    paperMode: CONFIG.paperTrading,
+    paperBroker: paperBroker ?? undefined,
   });
 
   arbService.on('opportunity', (opp) => {
@@ -650,6 +712,21 @@ async function setupArbitrage(sdk: PolymarketSDK) {
       state.arbProfit += result.profit;
       log('TRADE', `Arb executed: +$${result.profit.toFixed(2)}`);
       recordTrade(result.profit, 'arbitrage');
+      // Paper bridge: one execution settles both legs atomically, so book
+      // the fill and its close together (realized edge only from fills).
+      if (paperAccount && result.simulated === true) {
+        const key = state.activeArbMarket ?? 'arbitrage';
+        const size = result.size ?? 0;
+        if (size > 0) {
+          paperAccount.recordFill({
+            marketKey: key, avgPrice: 0, filledSize: 0,
+            filledValueUsd: size, feeUsd: 0, slippageBps: 0,
+          });
+          trackExposure(key, size);
+        }
+        paperMarketClose(key, result.profit, size);
+        releaseExposure(key, size);
+      }
     }
   });
 
@@ -677,6 +754,9 @@ async function setupDipArb(sdk: PolymarketSDK) {
     autoExecute: !CONFIG.dryRun || CONFIG.paperTrading,
     debug: true,
     preExecutionGuard: riskGuard, // Audit #4: risk limits gate DipArb Leg1
+    // Paper: never touch on-chain merge — fills are simulated, so there is
+    // nothing real to merge; rotation settles through the broker instead.
+    autoMerge: !CONFIG.paperTrading,
   });
 
   sdk.dipArb.on('signal', (s) => log('SIGNAL', `DipArb: ${s.type} ${s.side}`));
@@ -684,6 +764,34 @@ async function setupDipArb(sdk: PolymarketSDK) {
     if (r.success) {
       log('TRADE', `DipArb ${r.leg}: ${r.side}`);
       recordTrade(0, 'dipArb');
+      // Paper bridge: leg1 opens simulated exposure; terminal legs
+      // (leg2/exit/merge) close it. Fill-layer PnL is unknown here, so
+      // terminal legs book a zero-PnL close that releases open exposure;
+      // realized edge for arb/smart-money books in their own handlers.
+      if (paperAccount && (r as { simulated?: boolean }).simulated === true) {
+        const leg = r as { leg?: string; price?: number; shares?: number };
+        const key = state.activeDipArbMarket ?? 'dipArb';
+        const legValue = (leg.price ?? 0) * (leg.shares ?? 0);
+        if (leg.leg === 'leg1') {
+          if (legValue > 0) {
+            paperAccount.recordFill({
+              marketKey: key,
+              avgPrice: leg.price ?? 0,
+              filledSize: leg.shares ?? 0,
+              filledValueUsd: legValue,
+              feeUsd: 0,
+              slippageBps: 0,
+            });
+            trackExposure(key, legValue);
+            paperMarketOpen(key, legValue);
+          }
+        } else {
+          const open = paperOpenUsd.get(key) ?? 0;
+          const rel = Math.min(legValue > 0 ? legValue : open, open);
+          paperMarketClose(key, 0, rel);
+          releaseExposure(key, rel);
+        }
+      }
     }
   });
   sdk.dipArb.on('rotate', (e) => {
@@ -696,7 +804,9 @@ async function setupDipArb(sdk: PolymarketSDK) {
       enabled: true,
       underlyings: ['ETH', 'BTC', 'SOL'],
       duration: '15m',
-      settleStrategy: 'redeem',
+      // Paper: 'sell' settles through the (broker-paired) TradingService;
+      // 'redeem' would queue real on-chain redemptions of simulated fills.
+      settleStrategy: CONFIG.paperTrading ? 'sell' : 'redeem',
       redeemWaitMinutes: 5,
     });
   }
@@ -969,6 +1079,16 @@ function displayStatus() {
   console.log(`    Current:      $${state.currentCapital.toFixed(2)} (Peak: $${state.peakCapital.toFixed(2)})`);
   console.log(`    Drawdown:     ${(state.currentDrawdown * 100).toFixed(1)}% / ${(CONFIG.risk.maxDrawdownFromPeak * 100).toFixed(0)}% max`);
   console.log(`    Arb Profit:   $${state.arbProfit >= 0 ? '+' : ''}${state.arbProfit.toFixed(2)}`);
+  if (CONFIG.paperTrading && paperAccount) {
+    const snap = paperAccount.getSnapshot();
+    console.log('─'.repeat(80));
+    console.log('  PAPER (simulated, broker fills only):');
+    console.log(`    PnL:        $${snap.realizedPnl >= 0 ? '+' : ''}${snap.realizedPnl.toFixed(2)} (fees $${snap.feesPaid.toFixed(2)}, ${snap.trades} closes, ${snap.wins}W/${snap.losses}L)`);
+    console.log(`    Capital:    $${snap.currentCapital.toFixed(2)} (Peak: $${snap.peakCapital.toFixed(2)})`);
+    console.log(`    Drawdown:   ${(snap.currentDrawdown * 100).toFixed(1)}% | Exposure: $${snap.totalExposureUsd.toFixed(2)}`);
+    console.log(`    Fill qual:  avg slip ${snap.avgSlippageBps.toFixed(1)}bps | partial ${(snap.partialRate * 100).toFixed(0)}%`);
+    console.log(`    Feed:       ${paperHealth.priceSource} | WS degraded: ${paperHealth.degraded}`);
+  }
   console.log('─'.repeat(80));
   console.log('  RISK STATUS:');
   const dailyPct = (Math.abs(state.dailyPnL) / CONFIG.capital.totalUsd * 100).toFixed(1);
@@ -1034,6 +1154,16 @@ async function main() {
 
   log('INFO', `Wallet: ${sdk.tradingService.getAddress()}`);
 
+  // Task 9: pair the shared TradingService with the PaperBroker in paper
+  // mode. DipArb + SmartMoney share this instance, so one pairing covers
+  // both; the Task 3 choke point requires paperMode AND paperBroker together.
+  if (CONFIG.paperTrading && paperBroker) {
+    const cfg = sdk.tradingService as unknown as { config: { paperMode?: boolean; paperBroker?: PaperBroker } };
+    cfg.config.paperMode = true;
+    cfg.config.paperBroker = paperBroker;
+    log('INFO', '📝 Paper mode: shared TradingService paired with PaperBroker (simulated fills, no live orders)');
+  }
+
   // Setup all services
   await setupSwap(sdk);
   await setupOnchain();
@@ -1054,6 +1184,25 @@ async function main() {
   setInterval(() => void refreshExposure(sdk), 60000);
   setInterval(() => void monitorMatic(), 5 * 60 * 1000);
   setInterval(() => void reconcilePnl(), 5 * 60 * 1000);
+  // Task 9: WS/feed health polling (log-only; resubscribe is handled
+  // inside the service — no restarts). sdk.realtime is the shared instance
+  // behind DipArb + SmartMoney; ArbitrageService owns a private realtime
+  // instance that this poll cannot reach (documented limitation).
+  setInterval(() => {
+    try {
+      const health = sdk.realtime.getHealth(90_000);
+      const degraded = health.subscriptions.filter(s => s.degraded);
+      paperHealth.degraded = degraded.length;
+      if (degraded.length > 0) log('WARN', `WS health degraded: ${degraded.map(s => s.subId).join(', ')}`);
+      const codes = health.disconnectCounts;
+      if ((codes['1006'] ?? 0) + (codes['1001'] ?? 0) + (codes['1012'] ?? 0) > 0) {
+        log('WARN', `WS disconnects 1006/1001/1012 seen`, codes);
+      }
+      const priceSource = (sdk.dipArb as unknown as { priceSource?: string }).priceSource ?? 'none';
+      paperHealth.priceSource = priceSource;
+      if (priceSource === 'none') log('WARN', 'DipArb price feed degraded: no chainlink/fallback quotes yet (rounds proceed with priceToBeat=0)');
+    } catch { /* health is best-effort */ }
+  }, 60_000);
 
   process.on('SIGINT', async () => {
     console.log('\n\nShutting down...');
