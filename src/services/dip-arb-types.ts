@@ -212,6 +212,14 @@ export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
 /** 支持的底层资产 */
 export type DipArbUnderlying = 'BTC' | 'ETH' | 'SOL' | 'XRP';
 
+/**
+ * Underlying price feed source (paper-trading Task 6).
+ * - 'chainlink': Chainlink `crypto_prices_chainlink` topic (primary)
+ * - 'fallback': non-chainlink `crypto_prices` topic (degraded)
+ * - 'none': no price received yet
+ */
+export type DipArbPriceSource = 'chainlink' | 'fallback' | 'none';
+
 /** 市场时长 */
 export type DipArbDuration = 5 | 15;
 
@@ -384,6 +392,11 @@ export interface DipArbExecutionResult {
   error?: string;
   /** 执行时间（毫秒） */
   executionTimeMs: number;
+  /**
+   * True when the fills were simulated via PaperBroker (paper mode).
+   * Threaded through from the broker-backed TradingService OrderResult.
+   */
+  simulated?: boolean;
 }
 
 /**
@@ -463,6 +476,10 @@ export interface DipArbNewRoundEvent {
   downOpen: number;
   startTime: number;
   endTime: number;
+  /** Feed that supplied priceToBeat (paper-trading Task 6). */
+  priceSource?: DipArbPriceSource;
+  /** True when the round started degraded (priceToBeat === 0, no feed). */
+  feedDegraded?: boolean;
 }
 
 /**
@@ -473,6 +490,8 @@ export interface DipArbPriceUpdateEvent {
   value: number;
   priceToBeat: number;
   changePercent: number;
+  /** Feed that supplied this update (paper-trading Task 6). */
+  priceSource?: DipArbPriceSource;
 }
 
 /**
@@ -496,6 +515,8 @@ export interface DipArbServiceEvents {
   roundComplete: (result: DipArbRoundResult) => void;
   priceUpdate: (event: DipArbPriceUpdateEvent) => void;
   orderbookUpdate: (event: DipArbOrderbookUpdateEvent) => void;
+  /** Emitted when a round starts degraded (priceToBeat === 0, no feed). */
+  feedDegraded: (event: { roundId: string; priceToBeat: number; priceSource: DipArbPriceSource }) => void;
   error: (error: Error) => void;
 }
 

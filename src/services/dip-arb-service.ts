@@ -36,7 +36,7 @@ import {
   type Subscription,
   type CryptoPrice,
 } from './realtime-service-v2.js';
-import { TradingService, type MarketOrderParams } from './trading-service.js';
+import { TradingService, type MarketOrderParams, type PaperQuote } from './trading-service.js';
 import { MarketService } from './market-service.js';
 import { CTFClient } from '../clients/ctf-client.js';
 import { resolvePolygonRpcUrl } from '../utils/rpc.js';
@@ -63,6 +63,7 @@ import {
   type DipArbRotateEvent,
   type DipArbUnderlying,
   type DipArbPendingRedemption,
+  type DipArbPriceSource,
   DEFAULT_DIP_ARB_CONFIG,
   DEFAULT_AUTO_ROTATE_CONFIG,
   createDipArbInitialStats,
@@ -99,6 +100,13 @@ export class DipArbService extends EventEmitter {
   // Subscriptions
   private marketSubscription: MarketSubscription | null = null;
   private chainlinkSubscription: Subscription | null = null;
+  private fallbackSubscription: Subscription | null = null;
+
+  // Price feed source tracking (paper-trading Task 6: chainlink primary,
+  // non-chainlink crypto_prices fallback). Rounds proceed degraded with
+  // priceToBeat = 0 when neither feed has produced — rotation never blocks.
+  public priceSource: DipArbPriceSource = 'none';
+  public priceSourceUpdatedAt = 0;
 
   // Auto-rotate state
   private rotateCheckInterval: ReturnType<typeof setInterval> | null = null;
@@ -198,6 +206,23 @@ export class DipArbService extends EventEmitter {
   }
 
   // ===== Public API: Configuration =====
+
+  /**
+   * Snapshot current orderbook state as a Task 3 PaperQuote. Every
+   * createMarketOrder call site carries this so paper fills simulate
+   * against live depth; the live TradingService ignores the extra param.
+   *
+   * DipArb tracks asks only (no bid state): the BUY legs simulate against
+   * the UP/DOWN asks, which is all the broker needs for buys.
+   */
+  private buildPaperQuote(): PaperQuote {
+    const map = (levels: Array<{ price: number; size: number }>) =>
+      levels.map((l) => ({ price: l.price, size: l.size }));
+    return {
+      bids: [],
+      asks: [...map(this.upAsks), ...map(this.downAsks)],
+    };
+  }
 
   /**
    * Update configuration
@@ -421,12 +446,21 @@ export class DipArbService extends EventEmitter {
       }
     );
 
+    // Fallback: non-chainlink crypto price topic for the underlying asset.
+    // Only engages when chainlink is absent or stale (>60s); chainlink always
+    // wins while fresh so the primary feed is never overridden by a lagging
+    // fallback quote.
+    this.fallbackSubscription = this.realtimeService.subscribeCryptoPrices(
+      [market.underlying],
+      { onPrice: (p) => { if (this.priceSource !== 'chainlink' || Date.now() - this.lastPriceUpdate > 60_000) this.handleFallbackPriceUpdate(p); } }
+    );
+
     // Heartbeat to reassure user
     setInterval(() => {
       if (this.isRunning) {
         const lastPrice = this.currentUnderlyingPrice > 0 ? this.currentUnderlyingPrice.toFixed(2) : 'Waiting';
         const timeSinceUpdate = this.lastPriceUpdate > 0 ? Math.round((Date.now() - this.lastPriceUpdate) / 1000) + 's ago' : 'Never';
-        this.log(`💓 Monitoring active. Last Price: $${lastPrice} (${timeSinceUpdate})`);
+        this.log(`💓 Monitoring active. Last Price: $${lastPrice} (${timeSinceUpdate}, source: ${this.priceSource})`);
       }
     }, 60000);
 
@@ -514,6 +548,11 @@ export class DipArbService extends EventEmitter {
     if (this.chainlinkSubscription) {
       this.chainlinkSubscription.unsubscribe();
       this.chainlinkSubscription = null;
+    }
+
+    if (this.fallbackSubscription) {
+      this.fallbackSubscription.unsubscribe();
+      this.fallbackSubscription = null;
     }
 
     // Update stats
@@ -652,6 +691,12 @@ export class DipArbService extends EventEmitter {
       let totalAmountSpent = 0;
       let lastOrderId: string | undefined;
       let failedOrders = 0;
+      let simulated = false;
+
+      // Paper quote: live depth snapshot so a broker-backed TradingService
+      // simulates fills with no live calls (Task 3 choke point); the live
+      // path ignores the extra param.
+      const paperQuote = this.buildPaperQuote();
 
       // 执行多笔订单
       for (let i = 0; i < splitCount; i++) {
@@ -663,6 +708,7 @@ export class DipArbService extends EventEmitter {
           amount: amountPerOrder,
           price: signal.targetPrice,
           orderType: 'FOK',
+          paperQuote,
         };
 
         if (this.config.debug && splitCount > 1) {
@@ -675,6 +721,7 @@ export class DipArbService extends EventEmitter {
           totalSharesFilled += sharesPerOrder;
           totalAmountSpent += amountPerOrder;
           lastOrderId = result.orderId;
+          if (result.simulated) simulated = true;
         } else {
           failedOrders++;
           this.log(`Leg1 order ${i + 1}/${splitCount} failed: ${result.errorMsg}`);
@@ -738,6 +785,7 @@ export class DipArbService extends EventEmitter {
           shares: totalSharesFilled,
           orderId: lastOrderId,
           executionTimeMs: execTimeMs,
+          simulated,
         };
       } else {
         return {
@@ -799,6 +847,12 @@ export class DipArbService extends EventEmitter {
       let totalAmountSpent = 0;
       let lastOrderId: string | undefined;
       let failedOrders = 0;
+      let simulated = false;
+
+      // Paper quote: live depth snapshot so a broker-backed TradingService
+      // simulates fills with no live calls (Task 3 choke point); the live
+      // path ignores the extra param.
+      const paperQuote = this.buildPaperQuote();
 
       // 执行多笔订单
       for (let i = 0; i < splitCount; i++) {
@@ -809,6 +863,7 @@ export class DipArbService extends EventEmitter {
           amount: amountPerOrder,
           price: signal.targetPrice,
           orderType: 'FOK',
+          paperQuote,
         };
 
         if (this.config.debug && splitCount > 1) {
@@ -821,6 +876,7 @@ export class DipArbService extends EventEmitter {
           totalSharesFilled += sharesPerOrder;
           totalAmountSpent += amountPerOrder;
           lastOrderId = result.orderId;
+          if (result.simulated) simulated = true;
         } else {
           failedOrders++;
           this.log(`Leg2 order ${i + 1}/${splitCount} failed: ${result.errorMsg}`);
@@ -936,6 +992,7 @@ export class DipArbService extends EventEmitter {
           shares: totalSharesFilled,
           orderId: lastOrderId,
           executionTimeMs: Date.now() - startTime,
+          simulated,
         };
       } else {
         return {
@@ -1156,6 +1213,8 @@ export class DipArbService extends EventEmitter {
 
     this.currentUnderlyingPrice = price.price;
     this.lastPriceUpdate = Date.now();
+    this.priceSource = 'chainlink';
+    this.priceSourceUpdatedAt = this.lastPriceUpdate;
 
     // Emit price update event
     if (this.currentRound) {
@@ -1166,6 +1225,38 @@ export class DipArbService extends EventEmitter {
         changePercent: this.currentRound.priceToBeat > 0
           ? ((price.price - this.currentRound.priceToBeat) / this.currentRound.priceToBeat) * 100
           : 0,
+        priceSource: this.priceSource,
+      };
+      this.emit('priceUpdate', event);
+    }
+  }
+
+  /**
+   * Fallback price update from the non-chainlink crypto price topic.
+   *
+   * Engages only when chainlink is absent or stale (>60s); a fresh chainlink
+   * feed always wins. Accepted updates drive the same underlying-price state
+   * so rounds keep rotating degraded instead of stalling without a feed.
+   */
+  private handleFallbackPriceUpdate(price: { symbol: string; price: number }): void {
+    if (!this.market) return;
+    if (price.symbol !== this.market.underlying) return;
+    if (this.priceSource === 'chainlink' && Date.now() - this.lastPriceUpdate < 60_000) return;
+    this.currentUnderlyingPrice = price.price;
+    this.lastPriceUpdate = Date.now();
+    this.priceSource = 'fallback';
+    this.priceSourceUpdatedAt = this.lastPriceUpdate;
+
+    // Emit price update event so consumers see the degraded source.
+    if (this.currentRound) {
+      const event: DipArbPriceUpdateEvent = {
+        underlying: this.market.underlying,
+        value: price.price,
+        priceToBeat: this.currentRound.priceToBeat,
+        changePercent: this.currentRound.priceToBeat > 0
+          ? ((price.price - this.currentRound.priceToBeat) / this.currentRound.priceToBeat) * 100
+          : 0,
+        priceSource: this.priceSource,
       };
       this.emit('priceUpdate', event);
     }
@@ -1219,9 +1310,16 @@ export class DipArbService extends EventEmitter {
         downOpen: downPrice,
         startTime: this.currentRound.startTime,
         endTime: this.currentRound.endTime,
+        priceSource: this.priceSource,
+        // Degraded when no feed has produced yet: the round still proceeds
+        // with priceToBeat = 0 — rotation never blocks on a missing feed.
+        feedDegraded: priceToBeat === 0,
       };
 
       this.emit('newRound', event);
+      if (event.feedDegraded) {
+        this.emit('feedDegraded', { roundId, priceToBeat, priceSource: this.priceSource });
+      }
       this.log(`New round: ${roundId}, Price to Beat: ${priceToBeat.toFixed(2)}`);
     }
 
