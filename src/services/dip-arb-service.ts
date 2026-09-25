@@ -31,6 +31,7 @@
 import { EventEmitter } from 'events';
 import {
   RealtimeServiceV2,
+  normalizeCryptoSymbol,
   type MarketSubscription,
   type OrderbookSnapshot,
   type Subscription,
@@ -53,6 +54,7 @@ import {
   type DipArbLeg2Signal,
   type DipArbExecutionResult,
   type DipArbRoundResult,
+  type DipArbLegInfo,
   type DipArbNewRoundEvent,
   type DipArbPriceUpdateEvent,
   type DipArbScanOptions,
@@ -77,6 +79,21 @@ import {
 } from './dip-arb-types.js';
 
 // ===== DipArbService =====
+
+/**
+ * Real economics of an emergency leg1 exit (paper-trading final-review Fix 1):
+ * `(soldPrice - leg1.price) * shares`. Negative when the stop-loss/timeout
+ * exit sells below the leg1 entry. Shared by both bot entry-point bridges so
+ * `roundComplete` exits close paper exposure with the same number the test pins.
+ */
+export function computeDipArbExitPnl(
+  exit: Pick<DipArbExecutionResult, 'price' | 'shares'>,
+  leg1: Pick<DipArbLegInfo, 'price' | 'shares'>,
+): number {
+  const soldPrice = exit.price ?? 0;
+  const shares = exit.shares ?? leg1.shares;
+  return (soldPrice - leg1.price) * shares;
+}
 
 export class DipArbService extends EventEmitter {
   // Dependencies
@@ -1240,7 +1257,9 @@ export class DipArbService extends EventEmitter {
    */
   private handleFallbackPriceUpdate(price: { symbol: string; price: number }): void {
     if (!this.market) return;
-    if (price.symbol !== this.market.underlying) return;
+    // Normalized match (final-review Fix 4): live `crypto_prices` symbols
+    // arrive as `ETHUSDT`-style while we subscribe by underlying (`ETH`).
+    if (normalizeCryptoSymbol(price.symbol) !== normalizeCryptoSymbol(this.market.underlying)) return;
     if (this.priceSource === 'chainlink' && Date.now() - this.lastPriceUpdate < 60_000) return;
     this.currentUnderlyingPrice = price.price;
     this.lastPriceUpdate = Date.now();
@@ -1412,7 +1431,8 @@ export class DipArbService extends EventEmitter {
       }
 
       // Market sell with a worst-price floor so the exit itself cannot sweep
-      // the book (PROBLEMS.md #2).
+      // the book (PROBLEMS.md #2). Paper quote included so a broker-backed
+      // TradingService simulates the exit (final-review Fix 1); live ignores it.
       const exitFloor = currentPrice * (1 - this.config.maxSlippage);
       const result = await this.tradingService.createMarketOrder({
         tokenId: leg1.tokenId,
@@ -1420,6 +1440,7 @@ export class DipArbService extends EventEmitter {
         amount: exitAmount,
         price: exitFloor,
         orderType: 'FOK',
+        paperQuote: this.buildPaperQuote(),
       });
 
       if (result.success) {
@@ -1444,6 +1465,8 @@ export class DipArbService extends EventEmitter {
           shares: leg1.shares,
           orderId: result.orderId,
           executionTimeMs: Date.now() - startTime,
+          // Thread the broker flag so paper bridges can gate on it (Fix 1).
+          simulated: result.simulated === true,
         };
       } else {
         this.log(`❌ Leg1 exit failed: ${result.errorMsg}`);

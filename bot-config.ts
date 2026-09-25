@@ -47,6 +47,7 @@ import {
 import { fetchClosedPnls } from './src/utils/closed-positions.js';
 import { PaperBroker } from './src/services/paper-broker.js';
 import { PaperAccount } from './src/services/paper-account.js';
+import { computeDipArbExitPnl } from './src/services/dip-arb-service.js';
 
 // ============================================================================
 // CONFIGURATION
@@ -642,7 +643,7 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
           log('TRADE', `Copied ${trade.side} from ${trade.traderAddress.slice(0, 8)}...`);
           // Paper bridge: broker fill detail rides on the paper OrderResult.
           if (paperAccount && (result as unknown as { simulated?: boolean }).simulated === true) {
-            const fill = result as unknown as { avgPrice?: number; filledSize?: number; feeUsd?: number };
+            const fill = result as unknown as { avgPrice?: number; filledSize?: number; feeUsd?: number; slippageBps?: number; partial?: boolean };
             const value = (fill.avgPrice ?? 0) * (fill.filledSize ?? 0);
             const key = trade.tokenId ?? trade.conditionId ?? trade.marketSlug ?? 'smartMoney';
             if (value > 0) {
@@ -652,8 +653,9 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
                 filledSize: fill.filledSize ?? 0,
                 filledValueUsd: value,
                 feeUsd: fill.feeUsd ?? 0,
-                slippageBps: 0,
+                slippageBps: fill.slippageBps ?? 0,
               });
+              if (fill.partial === true) paperAccount.markPartial();
               trackExposure(key, value);
               paperMarketOpen(key, value);
             }
@@ -717,11 +719,13 @@ async function setupArbitrage(sdk: PolymarketSDK) {
       if (paperAccount && result.simulated === true) {
         const key = state.activeArbMarket ?? 'arbitrage';
         const size = result.size ?? 0;
+        const quality = result as { slippageBps?: number; partial?: boolean };
         if (size > 0) {
           paperAccount.recordFill({
             marketKey: key, avgPrice: 0, filledSize: 0,
-            filledValueUsd: size, feeUsd: 0, slippageBps: 0,
+            filledValueUsd: size, feeUsd: 0, slippageBps: quality.slippageBps ?? 0,
           });
+          if (quality.partial === true) paperAccount.markPartial();
           trackExposure(key, size);
         }
         paperMarketClose(key, result.profit, size);
@@ -769,7 +773,7 @@ async function setupDipArb(sdk: PolymarketSDK) {
       // terminal legs book a zero-PnL close that releases open exposure;
       // realized edge for arb/smart-money books in their own handlers.
       if (paperAccount && (r as { simulated?: boolean }).simulated === true) {
-        const leg = r as { leg?: string; price?: number; shares?: number };
+        const leg = r as { leg?: string; price?: number; shares?: number; slippageBps?: number; partial?: boolean };
         const key = state.activeDipArbMarket ?? 'dipArb';
         const legValue = (leg.price ?? 0) * (leg.shares ?? 0);
         if (leg.leg === 'leg1') {
@@ -780,8 +784,9 @@ async function setupDipArb(sdk: PolymarketSDK) {
               filledSize: leg.shares ?? 0,
               filledValueUsd: legValue,
               feeUsd: 0,
-              slippageBps: 0,
+              slippageBps: leg.slippageBps ?? 0,
             });
+            if (leg.partial === true) paperAccount.markPartial();
             trackExposure(key, legValue);
             paperMarketOpen(key, legValue);
           }
@@ -797,6 +802,26 @@ async function setupDipArb(sdk: PolymarketSDK) {
   sdk.dipArb.on('rotate', (e) => {
     state.activeDipArbMarket = e.newMarket;
     log('INFO', `DipArb rotated to ${e.newMarket}`);
+  });
+
+  // Paper bridge (final-review Fix 1): emergency exits on expiry/stop-loss
+  // report via 'roundComplete'.exitResult, never 'execution'. Without this
+  // bridge the leg1 paper exposure would leak forever in eval metrics.
+  sdk.dipArb.on('roundComplete', (result) => {
+    const exit = result?.exitResult as
+      | { success?: boolean; simulated?: boolean; price?: number; shares?: number }
+      | null
+      | undefined;
+    if (paperAccount && exit?.success === true && exit.simulated === true) {
+      const key = state.activeDipArbMarket ?? 'dipArb';
+      const pnl = result?.leg1 ? computeDipArbExitPnl(exit, result.leg1) : 0;
+      const open = paperOpenUsd.get(key) ?? 0;
+      const exitValue = (exit.price ?? 0) * (exit.shares ?? 0);
+      const rel = Math.min(exitValue > 0 ? exitValue : open, open);
+      log('TRADE', `DipArb exit closed ${key} @ PnL $${pnl.toFixed(2)}`);
+      paperMarketClose(key, pnl, rel);
+      releaseExposure(key, rel);
+    }
   });
 
   if (CONFIG.dipArb.autoRotate) {

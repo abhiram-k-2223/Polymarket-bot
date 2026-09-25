@@ -128,6 +128,10 @@ export interface OrderResult {
   avgPrice?: number;
   filledSize?: number;
   feeUsd?: number;
+  /** Fill quality vs top-of-book, in basis points (paper fills; final-review Fix 2). */
+  slippageBps?: number;
+  /** True when the book could not cover the full size (paper fills; Fix 2). */
+  partial?: boolean;
 }
 
 export interface TradeInfo {
@@ -309,7 +313,7 @@ export class TradingService {
         side: params.side, price: params.price, size: params.size,
         bids: q.bids, asks: q.asks,
       });
-      return { success: fill.success, orderId: fill.orderId, errorMsg: fill.reason, simulated: true, avgPrice: fill.avgPrice, filledSize: fill.filledSize, feeUsd: fill.feeUsd };
+      return { success: fill.success, orderId: fill.orderId, errorMsg: fill.reason, simulated: true, avgPrice: fill.avgPrice, filledSize: fill.filledSize, feeUsd: fill.feeUsd, slippageBps: fill.slippageBps, partial: fill.partial };
     }
     // Validate minimum order requirements before sending to API
     if (params.size < MIN_ORDER_SIZE_SHARES) {
@@ -386,7 +390,7 @@ export class TradingService {
         side: params.side, amountUsd: params.amount,
         bids: q.bids, asks: q.asks, referencePrice: params.price,
       });
-      return { success: fill.success, orderId: fill.orderId, errorMsg: fill.reason, simulated: true, avgPrice: fill.avgPrice, filledSize: fill.filledSize, feeUsd: fill.feeUsd };
+      return { success: fill.success, orderId: fill.orderId, errorMsg: fill.reason, simulated: true, avgPrice: fill.avgPrice, filledSize: fill.filledSize, feeUsd: fill.feeUsd, slippageBps: fill.slippageBps, partial: fill.partial };
     }
     // Validate minimum order value before sending to API
     if (params.amount < MIN_ORDER_VALUE_USDC) {

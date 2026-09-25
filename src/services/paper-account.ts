@@ -53,8 +53,10 @@ export class PaperAccount {
     // caller passes pnl net of fill fees when available; ledger keeps fee total separately
     this.exposure = Math.max(0, this.exposure - releaseUsd);
     this.perMarket[marketKey] = Math.max(0, (this.perMarket[marketKey] ?? 0) - releaseUsd);
-    if (pnlUsd < 0) { this.losses += 1; this.conL += 1; this.conW = 0; }
-    else { this.wins += 1; this.conW += 1; this.conL = 0; }
+    if (pnlUsd > 0) { this.wins += 1; this.conW += 1; this.conL = 0; }
+    else if (pnlUsd < 0) { this.losses += 1; this.conL += 1; this.conW = 0; }
+    // pnlUsd === 0: neither win nor loss (final-review Fix 3). Exposure
+    // release and the close/trade count above still apply.
     const current = this.starting + this.realized - this.fees;
     if (current > this.peak) this.peak = current;
   }

@@ -31,6 +31,7 @@ import {
 import { fetchClosedPnls } from './src/utils/closed-positions.js';
 import { PaperBroker } from './src/services/paper-broker.js';
 import { PaperAccount } from './src/services/paper-account.js';
+import { computeDipArbExitPnl } from './src/services/dip-arb-service.js';
 
 // ============================================================================
 // CONFIGURATION (same as bot-config.ts)
@@ -590,11 +591,13 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
       if (paperAccount && result.simulated === true) {
         const key = state.activeArbMarket ?? 'arbitrage';
         const size = result.size ?? 0;
+        const quality = result as { slippageBps?: number; partial?: boolean };
         if (size > 0) {
           paperAccount.recordFill({
             marketKey: key, avgPrice: 0, filledSize: 0,
-            filledValueUsd: size, feeUsd: 0, slippageBps: 0,
+            filledValueUsd: size, feeUsd: 0, slippageBps: quality.slippageBps ?? 0,
           });
+          if (quality.partial === true) paperAccount.markPartial();
           paperMarketOpen(key, size);
         }
         paperMarketClose(key, result.profit || 0, size);
@@ -748,8 +751,9 @@ async function setupDipArb(sdk: PolymarketSDK) {
               filledSize: r.shares,
               filledValueUsd: legValue,
               feeUsd: 0,
-              slippageBps: 0,
+              slippageBps: typeof r.slippageBps === 'number' ? r.slippageBps : 0,
             });
+            if (r.partial === true) paperAccount.markPartial();
             paperMarketOpen(key, legValue);
           }
         } else {
@@ -767,6 +771,26 @@ async function setupDipArb(sdk: PolymarketSDK) {
     state.dipArb.marketName = e.newMarket;
     log('ARB', `DipArb rotated to ${e.newMarket}`);
     updateDashboard();
+  });
+
+  // Paper bridge (final-review Fix 1): emergency exits on expiry/stop-loss
+  // report via 'roundComplete'.exitResult, never 'execution'. Without this
+  // bridge the leg1 paper exposure would leak forever in eval metrics.
+  sdk.dipArb.on('roundComplete', (result: any) => {
+    const exit = result?.exitResult as
+      | { success?: boolean; simulated?: boolean; price?: number; shares?: number }
+      | null
+      | undefined;
+    if (paperAccount && exit?.success === true && exit.simulated === true) {
+      const key = state.activeDipArbMarket ?? 'dipArb';
+      const pnl = result?.leg1 ? computeDipArbExitPnl(exit, result.leg1) : 0;
+      const open = paperOpenUsd.get(key) ?? 0;
+      const exitValue = (exit.price ?? 0) * (exit.shares ?? 0);
+      const rel = Math.min(exitValue > 0 ? exitValue : open, open);
+      log('TRADE', `DipArb exit closed ${key} @ PnL $${pnl.toFixed(2)}`);
+      paperMarketClose(key, pnl, rel);
+      updateDashboard();
+    }
   });
 
   // Enable auto-rotate if configured

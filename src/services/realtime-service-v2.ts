@@ -22,6 +22,22 @@ import {
 } from '@polymarket/real-time-data-client';
 import type { PriceUpdate, BookUpdate, Orderbook, OrderbookLevel } from '../core/types.js';
 
+/**
+ * Normalize a crypto price symbol for fallback matching (paper-trading
+ * final-review Fix 4). Live `crypto_prices` symbols arrive as `ETHUSDT`-style
+ * while DipArb subscribes by underlying (`ETH`): strip trailing USDT and
+ * /USD-style suffixes, compare case-insensitively.
+ */
+export function normalizeCryptoSymbol(symbol: string): string {
+  const upper = symbol.trim().toUpperCase();
+  for (const suffix of ['/USDT', '/USD', 'USDT']) {
+    if (upper.endsWith(suffix) && upper.length > suffix.length) {
+      return upper.slice(0, -suffix.length);
+    }
+  }
+  return upper;
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -666,7 +682,10 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.sendSubscription({ subscriptions });
 
     const handler = (price: CryptoPrice) => {
-      if (symbols.includes(price.symbol)) {
+      // Normalized match (final-review Fix 4): live symbols arrive as
+      // `ETHUSDT`-style while callers subscribe by underlying (`ETH`).
+      const incoming = normalizeCryptoSymbol(price.symbol);
+      if (symbols.some((s) => normalizeCryptoSymbol(s) === incoming)) {
         handlers.onPrice?.(price);
       }
     };

@@ -31,4 +31,16 @@ describe('PaperAccount', () => {
     const s = a.getSnapshot();
     expect(s.avgSlippageBps).toBeCloseTo(100, 10);
   });
+  it('zero-PnL closes count as neither win nor loss (final-review Fix 3)', () => {
+    const a = new PaperAccount(100);
+    a.recordFill({ marketKey: 'm1', avgPrice: 0.5, filledSize: 20, filledValueUsd: 10, feeUsd: 0, slippageBps: 0 });
+    a.recordClose(0, 'm1', 10);
+    const s = a.getSnapshot();
+    expect(s.trades).toBe(1);
+    expect(s.wins).toBe(0);
+    expect(s.losses).toBe(0);
+    expect(s.consecutiveWins).toBe(0);
+    expect(s.consecutiveLosses).toBe(0);
+    expect(s.totalExposureUsd).toBeCloseTo(0, 10);
+  });
 });
