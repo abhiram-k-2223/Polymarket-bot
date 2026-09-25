@@ -145,6 +145,7 @@ let CONFIG = {
   },
 
   dryRun: process.env.DRY_RUN !== 'false',
+  paperTrading: process.env.PAPER_TRADING === 'true',
 };
 
 // ============================================================================
@@ -517,12 +518,12 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
 
   // Create standalone ArbitrageService (not using SDK wrapper)
   arbService = new ArbitrageService({
-    privateKey: CONFIG.dryRun ? undefined : process.env.POLYMARKET_PRIVATE_KEY,
+    privateKey: (!CONFIG.dryRun && !CONFIG.paperTrading) ? process.env.POLYMARKET_PRIVATE_KEY : undefined,
     profitThreshold: CONFIG.arbitrage.profitThreshold,
     minTradeSize: CONFIG.arbitrage.minTradeSize,
     maxTradeSize: CONFIG.arbitrage.maxTradeSize,
-    autoExecute: !CONFIG.dryRun && CONFIG.arbitrage.autoExecute,
-    enableRebalancer: !CONFIG.dryRun && CONFIG.arbitrage.enableRebalancer,
+    autoExecute: (!CONFIG.dryRun || CONFIG.paperTrading) && CONFIG.arbitrage.autoExecute,
+    enableRebalancer: (!CONFIG.dryRun || CONFIG.paperTrading) && CONFIG.arbitrage.enableRebalancer,
     enableLogging: true,
   });
 
@@ -594,7 +595,7 @@ async function setupDipArb(sdk: PolymarketSDK) {
   sdk.dipArb.updateConfig({
     shares: CONFIG.dipArb.shares,
     sumTarget: CONFIG.dipArb.sumTarget,
-    autoExecute: !CONFIG.dryRun,
+    autoExecute: !CONFIG.dryRun || CONFIG.paperTrading,
     debug: true,
   });
 
@@ -814,6 +815,7 @@ async function setupSwap() {
 }
 
 async function setupOnchain() {
+  // PAPER_TRADING never enables real on-chain ops: this gate stays dry-run-only.
   if (!CONFIG.onchain.enabled || CONFIG.dryRun) return;
   log('CHAIN', 'Checking on-chain approvals...');
 
@@ -1123,6 +1125,8 @@ async function main() {
 
   log('INFO', 'Configuration', {
     binance: CONFIG.binance.enabled,
+    dryRun: CONFIG.dryRun,
+    paperTrading: CONFIG.paperTrading,
   });
 
   // Handle Dashboard Commands
@@ -1162,7 +1166,7 @@ async function main() {
 
         // 2. DipArb (Update config)
         sdk.dipArb.updateConfig({
-          autoExecute: !CONFIG.dryRun, // Live = autoExecute true (if config enabled)
+          autoExecute: !CONFIG.dryRun || CONFIG.paperTrading, // Live = autoExecute true (if config enabled)
         });
 
         // Emit new config to dashboard
@@ -1178,7 +1182,7 @@ async function main() {
         };
         dashboardEmitter.updateConfig(newDashboardConfig);
 
-        log('WARN', `⚠️ BOT MODE CHANGED TO: ${CONFIG.dryRun ? '🧪 DRY RUN' : '🔴 LIVE'}`);
+        log('WARN', `⚠️ BOT MODE CHANGED TO: ${(!CONFIG.dryRun && !CONFIG.paperTrading) ? '🔴 LIVE' : CONFIG.paperTrading ? '📝 PAPER TRADING' : '🧪 DRY RUN'}`);
       }
     }
   });
@@ -1459,7 +1463,7 @@ async function main() {
     console.log('              POLYMARKET BOT v3.0 STATUS');
     console.log('═'.repeat(70));
     console.log(`  Runtime:        ${runtime} minutes`);
-    console.log(`  Mode:           ${CONFIG.dryRun ? '🧪 DRY RUN' : '🔴 LIVE'}`);
+    console.log(`  Mode:           ${(!CONFIG.dryRun && !CONFIG.paperTrading) ? '🔴 LIVE' : CONFIG.paperTrading ? '📝 PAPER TRADING' : '🧪 DRY RUN'}`);
     console.log(`  Status:         ${state.isPaused ? '⏸️ PAUSED' : '▶️ ACTIVE'}`);
     console.log('─'.repeat(70));
     console.log('  BALANCES:');

@@ -166,6 +166,7 @@ const CONFIG = {
   },
 
   dryRun: process.env.DRY_RUN !== 'false',
+  paperTrading: process.env.PAPER_TRADING === 'true',
 };
 
 // ============================================================================
@@ -592,7 +593,7 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
   state.followedWallets = qualified;
   log('WALLET', `Following ${qualified.length} wallets`);
 
-  if (!CONFIG.dryRun) {
+  if (!CONFIG.dryRun || CONFIG.paperTrading) {
     await sdk.smartMoney.startAutoCopyTrading({
       targetAddresses: qualified,
       sizeScale: CONFIG.smartMoney.sizeScale,
@@ -600,7 +601,7 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
       maxSlippage: CONFIG.smartMoney.maxSlippage,
       minTradeSize: CONFIG.smartMoney.minTradeSize,
       delay: CONFIG.smartMoney.delay,
-      dryRun: false,
+      dryRun: !CONFIG.paperTrading,
       preExecutionGuard: riskGuard, // Audit #4: risk limits gate copy BUYs
       onTrade: (trade, result) => {
         if (result.success) {
@@ -629,13 +630,13 @@ async function setupArbitrage(sdk: PolymarketSDK) {
   log('ARB', 'Setting up ArbitrageService...');
 
   arbService = new ArbitrageService({
-    privateKey: CONFIG.dryRun ? undefined : process.env.POLYMARKET_PRIVATE_KEY,
+    privateKey: (!CONFIG.dryRun && !CONFIG.paperTrading) ? process.env.POLYMARKET_PRIVATE_KEY : undefined,
     rpcUrl: process.env.POLYGON_RPC_URL, // P8: configurable RPC
     profitThreshold: CONFIG.arbitrage.profitThreshold,
     minTradeSize: CONFIG.arbitrage.minTradeSize,
     maxTradeSize: CONFIG.arbitrage.maxTradeSize,
-    autoExecute: !CONFIG.dryRun && CONFIG.arbitrage.autoExecute,
-    enableRebalancer: !CONFIG.dryRun && CONFIG.arbitrage.enableRebalancer,
+    autoExecute: (!CONFIG.dryRun || CONFIG.paperTrading) && CONFIG.arbitrage.autoExecute,
+    enableRebalancer: (!CONFIG.dryRun || CONFIG.paperTrading) && CONFIG.arbitrage.enableRebalancer,
     enableLogging: true,
     preExecutionGuard: riskGuard, // Audit #4: risk limits gate arb too
   });
@@ -673,7 +674,7 @@ async function setupDipArb(sdk: PolymarketSDK) {
   sdk.dipArb.updateConfig({
     shares: CONFIG.dipArb.shares,
     sumTarget: CONFIG.dipArb.sumTarget,
-    autoExecute: !CONFIG.dryRun,
+    autoExecute: !CONFIG.dryRun || CONFIG.paperTrading,
     debug: true,
     preExecutionGuard: riskGuard, // Audit #4: risk limits gate DipArb Leg1
   });
@@ -713,6 +714,7 @@ async function setupDipArb(sdk: PolymarketSDK) {
 let onchainService: OnchainService | null = null;
 
 async function setupOnchain() {
+  // PAPER_TRADING never enables real on-chain ops: this gate stays dry-run-only.
   if (!CONFIG.onchain.enabled || CONFIG.dryRun) {
     log('CHAIN', 'OnchainService disabled or dry run');
     return;
@@ -758,6 +760,7 @@ async function setupOnchain() {
 // ============================================================================
 
 async function setupSwap(sdk: PolymarketSDK) {
+  // PAPER_TRADING never enables real on-chain ops: this gate stays dry-run-only.
   if (CONFIG.dryRun) {
     log('SWAP', 'SwapService disabled in dry run');
     return;
@@ -895,7 +898,7 @@ async function queryOnchainData(sdk: PolymarketSDK) {
 // ============================================================================
 
 async function setupDirectTrading(sdk: PolymarketSDK) {
-  if (!CONFIG.directTrading.enabled || CONFIG.dryRun) {
+  if (!CONFIG.directTrading.enabled || (CONFIG.dryRun && !CONFIG.paperTrading)) {
     log('INFO', 'Direct trading disabled');
     return;
   }
@@ -951,7 +954,7 @@ function displayStatus() {
   console.log('           POLYMARKET TRADING BOT v3.0 - ENHANCED RISK MANAGEMENT');
   console.log('═'.repeat(80));
   console.log(`  Runtime:        ${runtime} minutes`);
-  console.log(`  Mode:           ${CONFIG.dryRun ? '🧪 DRY RUN' : '🔴 LIVE TRADING'}`);
+  console.log(`  Mode:           ${(!CONFIG.dryRun && !CONFIG.paperTrading) ? '🔴 LIVE TRADING' : CONFIG.paperTrading ? '📝 PAPER TRADING' : '🧪 DRY RUN'}`);
   console.log(`  Status:         ${state.permanentlyHalted ? '🛑 HALTED (TOTAL LOSS)' : state.isPaused ? '⏸️ PAUSED' : '✅ ACTIVE'}`);
   console.log('─'.repeat(80));
   console.log('  BALANCES:');
@@ -1014,6 +1017,7 @@ async function main() {
   log('INFO', 'Configuration', {
     capital: `$${CONFIG.capital.totalUsd}`,
     dryRun: CONFIG.dryRun,
+    paperTrading: CONFIG.paperTrading,
     strategies: {
       smartMoney: CONFIG.smartMoney.enabled,
       arbitrage: CONFIG.arbitrage.enabled,
