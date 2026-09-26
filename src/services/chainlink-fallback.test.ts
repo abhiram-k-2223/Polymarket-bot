@@ -156,3 +156,34 @@ describe('cryptoFallbackSymbols wire variants', () => {
     expect(cryptoFallbackSymbols('  eth ')).toEqual(['ETH', 'ETHUSDT']);
   });
 });
+
+describe('zero-price dump frames are ignored', () => {
+  it('fallback ignores a matching symbol with no parseable price', async () => {
+    const svc = new DipArbService({} as never, null as never, {} as never);
+    (svc as unknown as { market: unknown }).market = { underlying: 'ETH', slug: 'test' };
+    const s = svc as unknown as {
+      handleFallbackPriceUpdate: (p: { symbol: string; price: number }) => void;
+      priceSource: string; lastPriceUpdate: number; currentUnderlyingPrice: number;
+    };
+    s.handleFallbackPriceUpdate({ symbol: 'ETHUSDT', price: 0 });
+    s.handleFallbackPriceUpdate({ symbol: 'ETHUSDT', price: Number.NaN });
+    expect(svc.priceSource).toBe('none');
+    expect(s.lastPriceUpdate).toBe(0);
+    expect(s.currentUnderlyingPrice).toBe(0);
+  });
+
+  it('parser drops valueless dump payloads but emits live quotes', async () => {
+    const { RealtimeServiceV2 } = await import('./realtime-service-v2.js');
+    const svc = new RealtimeServiceV2({ autoReconnect: false });
+    const seen: Array<{ symbol: string; price: number }> = [];
+    svc.on('cryptoPrice', (p: { symbol: string; price: number }) => seen.push(p));
+    const h = svc as unknown as {
+      handleCryptoPriceMessage: (payload: Record<string, unknown>, ts: number) => void;
+    };
+    h.handleCryptoPriceMessage({ symbol: 'ETHUSDT' }, 1);
+    h.handleCryptoPriceMessage({ symbol: 'ETHUSDT', value: 'garbage' }, 1);
+    expect(seen).toEqual([]);
+    h.handleCryptoPriceMessage({ symbol: 'ETHUSDT', value: '3000.5' }, 1);
+    expect(seen).toEqual([{ symbol: 'ETHUSDT', price: 3000.5, timestamp: expect.any(Number) }]);
+  });
+});

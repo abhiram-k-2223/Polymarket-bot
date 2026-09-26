@@ -1154,21 +1154,26 @@ export class RealtimeServiceV2 extends EventEmitter {
   }
 
   private handleCryptoPriceMessage(payload: Record<string, unknown>, timestamp: number): void {
-    const price: CryptoPrice = {
+    const price = Number(payload.value);
+    // Ignore connection-time historical dumps and malformed frames (no
+    // parseable value): emitting a $0 quote poisons DipArb's fallback feed
+    // (source flips without a real price). Live updates carry `value`.
+    if (!Number.isFinite(price) || price <= 0) return;
+    this.emit('cryptoPrice', {
       symbol: payload.symbol as string || '',
-      price: Number(payload.value) || 0,
+      price,
       timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
-    };
-    this.emit('cryptoPrice', price);
+    } as CryptoPrice);
   }
 
   private handleCryptoChainlinkPriceMessage(payload: Record<string, unknown>, timestamp: number): void {
-    const price: CryptoPrice = {
+    const price = Number(payload.value);
+    if (!Number.isFinite(price) || price <= 0) return;
+    this.emit('cryptoChainlinkPrice', {
       symbol: payload.symbol as string || '',
-      price: Number(payload.value) || 0,
+      price,
       timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
-    };
-    this.emit('cryptoChainlinkPrice', price);
+    } as CryptoPrice);
   }
 
   private handleEquityPriceMessage(payload: Record<string, unknown>, timestamp: number): void {

@@ -1222,6 +1222,7 @@ export class DipArbService extends EventEmitter {
 
   private handleChainlinkPriceUpdate(price: CryptoPrice): void {
     if (!this.market) return;
+    if (!Number.isFinite(price.price) || price.price <= 0) return;
 
     // Only handle updates for our underlying (symbol format: ETH/USD)
     const expectedSymbol = `${this.market.underlying}/USD`;
@@ -1260,6 +1261,9 @@ export class DipArbService extends EventEmitter {
    */
   private handleFallbackPriceUpdate(price: { symbol: string; price: number }): void {
     if (!this.market) return;
+    // Drop zero/garbage quotes (connection dumps, malformed frames) so the
+    // feed never flips source without a real price behind it.
+    if (!Number.isFinite(price.price) || price.price <= 0) return;
     // Normalized match (final-review Fix 4): live `crypto_prices` symbols
     // arrive as `ETHUSDT`-style while we subscribe by underlying (`ETH`).
     if (normalizeCryptoSymbol(price.symbol) !== normalizeCryptoSymbol(this.market.underlying)) return;
