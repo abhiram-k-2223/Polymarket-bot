@@ -32,6 +32,7 @@ import { EventEmitter } from 'events';
 import {
   RealtimeServiceV2,
   normalizeCryptoSymbol,
+  cryptoFallbackSymbols,
   type MarketSubscription,
   type OrderbookSnapshot,
   type Subscription,
@@ -466,9 +467,11 @@ export class DipArbService extends EventEmitter {
     // Fallback: non-chainlink crypto price topic for the underlying asset.
     // Only engages when chainlink is absent or stale (>60s); chainlink always
     // wins while fresh so the primary feed is never overridden by a lagging
-    // fallback quote.
+    // fallback quote. Subscribes with wire-level variants (ETH + ETHUSDT):
+    // the server applies the symbol filter strictly while live frames are
+    // USDT-quoted, so a bare underlying filter receives nothing.
     this.fallbackSubscription = this.realtimeService.subscribeCryptoPrices(
-      [market.underlying],
+      cryptoFallbackSymbols(market.underlying),
       { onPrice: (p) => { if (this.priceSource !== 'chainlink' || Date.now() - this.lastPriceUpdate > 60_000) this.handleFallbackPriceUpdate(p); } }
     );
 

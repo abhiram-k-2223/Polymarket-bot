@@ -38,6 +38,20 @@ export function normalizeCryptoSymbol(symbol: string): string {
   return upper;
 }
 
+/**
+ * Wire-level subscribe symbols for the `crypto_prices` fallback feed.
+ *
+ * The server applies the `filters: { symbol }` strictly, while live frames
+ * arrive as `ETHUSDT`-style (see `subscribeCryptoPrices` docstring), so a
+ * bare `ETH` filter receives nothing. Subscribe to both the underlying and
+ * its USDT-quoted variant; client-side matching stays normalized.
+ */
+export function cryptoFallbackSymbols(underlying: string): string[] {
+  const base = underlying.trim().toUpperCase();
+  const live = base.endsWith('USDT') ? base : `${base}USDT`;
+  return base === live ? [base] : [base, live];
+}
+
 // ============================================================================
 // Types
 // ============================================================================

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { DipArbService, computeDipArbExitPnl } from './dip-arb-service.js';
-import { normalizeCryptoSymbol } from './realtime-service-v2.js';
+import { normalizeCryptoSymbol, cryptoFallbackSymbols } from './realtime-service-v2.js';
 import { PaperBroker } from './paper-broker.js';
 import { PaperAccount } from './paper-account.js';
 import { RateLimiter } from '../core/rate-limiter.js';
@@ -138,5 +138,21 @@ describe('dip-arb paper emergency exit releases exposure (final-review Fix 1)', 
     acct.recordClose(pnl, 'dipArb', Math.min(exitValue > 0 ? exitValue : legValue, legValue));
     expect(acct.getSnapshot().totalExposureUsd).toBeCloseTo(0, 10);
     expect(acct.getSnapshot().trades).toBe(1);
+  });
+});
+
+describe('cryptoFallbackSymbols wire variants', () => {
+  it("subscribes bare underlying plus USDT-quoted variant", () => {
+    expect(cryptoFallbackSymbols('ETH')).toEqual(['ETH', 'ETHUSDT']);
+    expect(cryptoFallbackSymbols('BTC')).toEqual(['BTC', 'BTCUSDT']);
+    expect(cryptoFallbackSymbols('SOL')).toEqual(['SOL', 'SOLUSDT']);
+  });
+
+  it('dedupes when the underlying is already USDT-quoted', () => {
+    expect(cryptoFallbackSymbols('ETHUSDT')).toEqual(['ETHUSDT']);
+  });
+
+  it('normalizes case and whitespace', () => {
+    expect(cryptoFallbackSymbols('  eth ')).toEqual(['ETH', 'ETHUSDT']);
   });
 });
